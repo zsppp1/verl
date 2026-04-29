@@ -14,6 +14,46 @@
 """
 Implement base data transfer protocol between any two functions, modules.
 We can subclass Protocol to define more detailed batch info with specific keys
+
+====== DataProto 是什么？======
+
+DataProto 是 verl 中最核心的数据传输结构，用于在各个模块之间传递训练数据。
+它可以看作是一个"增强版的 batch"，包含三部分数据：
+
+1. batch (TensorDict): 存放需要 GPU 计算的 PyTorch Tensor
+2. non_tensor_batch (dict): 存放不需要梯度的元数据（如文本、ID、配置）
+3. meta_info (dict): 存放全局元信息（如 token id、训练步数）
+
+====== 数据流转示例 ======
+
+训练流程中的数据变化：
+
+Step 1: 从 dataloader 获取原始数据
+  batch_dict = {'input_ids': tensor[4, 512], 'attention_mask': tensor[4, 512]}
+
+Step 2: 转换为 DataProto
+  batch = DataProto.from_single_dict(batch_dict)
+  batch.batch: TensorDict{input_ids, attention_mask}
+  batch.non_tensor_batch: {'raw_prompt': ['问题1', '问题2', ...]}
+
+Step 3: repeat(n=4) - 每个 prompt 生成多个 response
+  batch.repeat(n=4) → batch_size 从 4 变为 16
+  同一个 prompt 的 4 个 response 共享相同的 uid
+
+Step 4: generate_sequences - 生成 response
+  gen_batch_output.batch: 增加 'responses', 'input_ids', 'position_ids'
+
+Step 5: union - 合并生成结果
+  batch = batch.union(gen_batch_output)
+  batch 现包含：prompts + responses + 其他
+
+Step 6: compute_reward - 计算 reward
+  batch.batch 增加 'token_level_scores', 'token_level_rewards'
+
+Step 7: compute_advantage - 计算 advantage
+  batch.batch 增加 'advantages', 'returns'
+
+Step 8: update_actor - 使用 batch 更新模型
 """
 
 import contextlib
@@ -73,24 +113,55 @@ _padding_size_key = "_padding_size_key_x123d"
 def pad_dataproto_to_divisor(data: "DataProto", size_divisor: int):
     """Pad a DataProto to size divisible by size_divisor
 
+    ====== 为什么需要 pad？======
+
+    分布式训练时，batch 需要平均分配给所有 Worker。
+    如果 batch_size 不能被 world_size 整除，会导致：
+    - 部分 Worker 处理更多样本，负载不均衡
+    - 同步等待时，其他 Worker 空闲等待
+
+    ====== pad 流程示例 ======
+
+    输入：batch_size=13, size_divisor=8 (8个Worker)
+    计算：13 % 8 = 5 ≠ 0，需要 pad
+    pad_size = 8 - 5 = 3
+
+    操作：复制前 3 个样本作为 padding
+    [s0,s1,...,s12] → [s0,s1,...,s12,s0,s1,s2]  (16个)
+
+    分配：每个 Worker 处理 2 个样本，负载均衡
+
+    后续：处理完成后 unpad，丢弃 padding 样本的结果
+
     Args:
-        size_divisor (int): size divisor
+        size_divisor (int): size divisor, 通常是 world_size
 
     Returns:
         data: (DataProto): the padded DataProto
-        pad_size (int)
+        pad_size (int): 填充了多少样本，用于后续 unpad
     """
     assert isinstance(data, DataProto), "data must be a DataProto"
+
+    # 检查是否需要 pad：如果 batch_size 已经能整除，就不需要
     if len(data) % size_divisor != 0:
+        # 计算需要填充多少样本才能整除
+        # 例如：13 % 8 = 5，需要 pad_size = 8 - 5 = 3
         pad_size = size_divisor - len(data) % size_divisor
         padding_protos = []
         remaining_pad = pad_size
+
+        # 复制前几个样本作为 padding
+        # 如果 pad_size > batch_size，会循环复制
         while remaining_pad > 0:
+            # 每次最多复制 batch_size 个（如果 pad_size 很大）
             take_size = min(remaining_pad, len(data))
             padding_protos.append(data[:take_size])
             remaining_pad -= take_size
+
+        # 合并原始数据和 padding 数据
         data_padded = DataProto.concat([data] + padding_protos)
     else:
+        # 不需要 pad
         if len(data) == 0:
             logging.warning("padding a DataProto with no item, no changed made")
         pad_size = 0
@@ -99,8 +170,19 @@ def pad_dataproto_to_divisor(data: "DataProto", size_divisor: int):
 
 
 def unpad_dataproto(data: "DataProto", pad_size):
-    """Unpad the data proto with pad_size. i.e. `data[:-pad_size]`"""
+    """Unpad the data proto with pad_size. i.e. `data[:-pad_size]`
+
+    ====== unpad 流程 ======
+
+    在 pad_dataproto_to_divisor 后处理完成，需要去除 padding 样本。
+
+    示例：
+    原始 13 个样本 → pad 到 16 个 → 处理 → unpad 回 13 个
+
+    data_padded[:13] 只保留真实样本，丢弃 padding 的结果
+    """
     if pad_size != 0:
+        # 删除最后 pad_size 个样本（这些是 padding）
         data = data[:-pad_size]
     return data
 
@@ -332,6 +414,92 @@ class DataProto:
     It contains a batch (TensorDict) and a meta_info (Dict). The batch is a TensorDict https://pytorch.org/tensordict/.
     TensorDict allows you to manipulate a dictionary of Tensors like a single Tensor. Ideally, the tensors with the
     same batch size should be put inside batch.
+
+    ====== DataProto 三大组成部分详解 ======
+
+    1. batch (TensorDict) - 需要 GPU 计算的 Tensor 数据
+       ┌─────────────────────────────────────────────────────┐
+       │  batch 字段示例：                                    │
+       │  ─────────────────                                 │
+       │  input_ids: [bsz, seq_len]      # prompt+response  │
+       │  attention_mask: [bsz, seq_len] # 1=有效,0=pad     │
+       │  prompts: [bsz, prompt_len]     # prompt 部分      │
+       │  responses: [bsz, resp_len]     # response 部分    │
+       │  position_ids: [bsz, seq_len]   # 位置编码         │
+       │  old_log_probs: [bsz, seq_len]  # π_old 的 log p  │
+       │  ref_log_probs: [bsz, seq_len]  # π_ref 的 log p  │
+       │  values: [bsz, seq_len]         # Critic 预测值   │
+       │  token_level_scores: [bsz, seq_len]  # reward     │
+       │  token_level_rewards: [bsz, seq_len] # reward+KL  │
+       │  advantages: [bsz, seq_len]     # Advantage       │
+       │  response_mask: [bsz, seq_len]  # 1=LLM生成,0=工具│
+       │  entropys: [bsz, seq_len]       # 熵值            │
+       └─────────────────────────────────────────────────────┘
+
+    2. non_tensor_batch (dict) - 不需要梯度的元数据
+       ┌─────────────────────────────────────────────────────┐
+       │  non_tensor_batch 字段示例：                        │
+       │  ───────────────────────                           │
+       │  uid: [bsz]              # 样本唯一ID (np.array)   │
+       │                         # 同prompt多response共享   │
+       │  raw_prompt: [bsz]       # 原始文本 prompt         │
+       │  data_source: [bsz]      # 数据来源(math/code等)  │
+       │  reward_model: [bsz]     # reward计算配置dict     │
+       │    ├── style: "rule"/"model"                       │
+       │    ├── ground_truth: "正确答案"                    │
+       │    └─────────────────────────────                  │
+       │  extra_info: [bsz]       # 其他信息dict           │
+       │  index: [bsz]            # 样本索引(用于追踪)     │
+       │  acc: [bsz]              # 准确率(用于DAPO过滤)   │
+       └─────────────────────────────────────────────────────┘
+
+    3. meta_info (dict) - 全局元信息
+       ┌─────────────────────────────────────────────────────┐
+       │  meta_info 字段示例：                               │
+       │  ─────────────────                                 │
+       │  eos_token_id: 151643      # 结束 token           │
+       │  pad_token_id: 0           # padding token        │
+       │  global_steps: 100         # 当前训练步数         │
+       │  do_sample: True           # 是否采样生成         │
+       │  temperature: 1.0          # 生成温度             │
+       │  validate: False           # 是否验证模式         │
+       │  timing: dict              # 时间统计             │
+       │  metrics: dict             # 性能指标             │
+       └─────────────────────────────────────────────────────┘
+
+    ====== 关键方法速查 ======
+
+    | 方法 | 作用 | 数据变化 |
+    |------|------|----------|
+    | from_single_dict() | 从 dict 创建 | dict → DataProto |
+    | repeat(n) | 每个 prompt 复制 n 次 | bsz → bsz*n |
+    | union(other) | 合并两个 DataProto | 增加 key |
+    | chunk(n) | 分成 n 份 | bsz → n份 |
+    | select_idxs() | 选择特定索引 | 筛选样本 |
+    | pop() | 取出并删除部分 | 减少 key |
+    | to(device) | 移动到 GPU | CPU → GPU |
+    | concat() | 合并多个 DataProto | n → 1 |
+
+    ====== 典型使用示例 ======
+
+    # 创建
+    batch = DataProto.from_single_dict({'input_ids': tensor, ...})
+
+    # repeat - 每个 prompt 生成 4 个 response
+    batch = batch.repeat(n=4, interleave=True)
+    # interleave=True: [p1,p1,p1,p1, p2,p2,p2,p2, ...]
+    # interleave=False: [p1,p2,p3,p4, p1,p2,p3,p4, ...]
+
+    # union - 合并生成结果
+    batch = batch.union(gen_output)  # 增加 responses
+
+    # chunk - 分给多个 Worker
+    chunks = batch.chunk(num_workers)
+
+    # 索引
+    batch[0]      → DataProtoItem (单个样本)
+    batch[0:10]   → DataProto (切片)
+    batch[[1,3,5]] → DataProto (选择特定索引)
     """
 
     batch: TensorDict = None
@@ -489,18 +657,50 @@ class DataProto:
 
     @classmethod
     def from_single_dict(cls, data: dict[str, torch.Tensor | np.ndarray], meta_info=None, auto_padding=False):
-        """Create a DataProto from a dict of tensors and non_tensors"""
+        """Create a DataProto from a dict of tensors and non_tensors
+
+        ====== 使用场景 ======
+
+        这是最常用的 DataProto 创建方法，从 dataloader 返回的 dict 创建。
+
+        ====== 输入示例 ======
+
+        data = {
+            'input_ids': torch.tensor([[1,2,3,...], [4,5,6,...]]),  # Tensor → batch
+            'attention_mask': torch.tensor([[1,1,1,...], [1,1,0,...]]),
+            'raw_prompt': np.array(['问题1', '问题2'], dtype=object),  # ndarray → non_tensor_batch
+            'uid': np.array(['id1', 'id2'], dtype=object),
+        }
+
+        ====== 输出结果 ======
+
+        DataProto:
+            batch = TensorDict{'input_ids', 'attention_mask'}
+            non_tensor_batch = {'raw_prompt': np.array, 'uid': np.array}
+            meta_info = {} 或传入的 meta_info
+
+        ====== 数据来源 ======
+
+        通常来自 RLHFDataset 的 __getitem__ 方法：
+        - Tensor 数据：tokenized 的 input_ids, attention_mask
+        - non_tensor 数据：原始文本、uid、ground_truth 等
+        """
+        # 分离 Tensor 和 non_tensor 数据
         tensors = {}
         non_tensors = {}
 
+        # 遍历输入 dict，按类型分类
         for key, val in data.items():
             if isinstance(val, torch.Tensor):
+                # PyTorch Tensor → batch (需要 GPU 计算)
                 tensors[key] = val
             elif isinstance(val, np.ndarray):
+                # NumPy array → non_tensor_batch (不需要梯度)
                 non_tensors[key] = val
             else:
                 raise ValueError(f"Unsupported type in data {type(val)}")
 
+        # 调用 from_dict 完成创建
         return cls.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=meta_info, auto_padding=auto_padding)
 
     @classmethod
@@ -797,14 +997,58 @@ class DataProto:
         - the batch size of two data batch is not the same
         - there are conflict keys in meta_info and they are not the same.
 
+        ====== 使用场景 ======
+
+        在训练流程中，将生成结果合并到原始 batch：
+        1. 原始 batch 只有 prompt 相关数据
+        2. generate_sequences 返回 gen_batch_output，包含 response
+        3. union 合并，batch 现包含 prompt + response
+
+        ====== 输入输出示例 ======
+
+        self (原始 batch):
+          batch: {'prompts': tensor[16, 100], 'input_ids': tensor[16, 100]}
+          non_tensor_batch: {'uid': np.array, 'raw_prompt': np.array}
+
+        other (gen_batch_output):
+          batch: {'responses': tensor[16, 200], 'input_ids': tensor[16, 300], 'position_ids': tensor[16, 300]}
+          non_tensor_batch: {}
+
+        union 后：
+          batch: {'prompts', 'responses', 'input_ids', 'position_ids'}  # 合并所有 key
+          non_tensor_batch: {'uid', 'raw_prompt'}  # 保持不变
+
+        ====== 数据流变化 ======
+
+        Step 1: batch = DataProto.from_single_dict(batch_dict)
+                → 只有 prompt 数据
+
+        Step 2: gen_batch = _get_gen_batch(batch)
+                → 分离生成需要的部分
+
+        Step 3: gen_batch_output = generate_sequences(gen_batch)
+                → 增加 response 数据
+
+        Step 4: batch = batch.union(gen_batch_output)
+                → 合并，batch 现包含完整数据
+
+        ====== 注意 ======
+
+        - batch_size 必须相同
+        - 如果有冲突的 key，必须值相同（否则报错）
+        - 常见冲突：input_ids（需要确认值相同）
+
         Args:
             other (DataProto): another DataProto to union
 
         Returns:
             DataProto: the DataProto after union
         """
+        # 合并 batch (TensorDict)
         self.batch = union_tensor_dict(self.batch, other.batch)
+        # 合并 non_tensor_batch (numpy dict)
         self.non_tensor_batch = union_numpy_dict(self.non_tensor_batch, other.non_tensor_batch)
+        # 合并 meta_info (普通 dict)
         self.meta_info = union_two_dict(self.meta_info, other.meta_info)
         return self
 
@@ -983,26 +1227,65 @@ class DataProto:
         """
         Repeat the batch data a specified number of times.
 
+        ====== 使用场景 ======
+
+        在 RLHF 训练中，需要为每个 prompt 生成多个 response：
+        - PPO/GRPO：每个 prompt 生成 n 个 response，用于计算 group advantage
+        - DAPO：每个 prompt 生成 n 个 response，用于动态采样过滤
+        - 验证时：每个 prompt 生成 n 个 response，计算 mean@N/best@N
+
+        ====== 输入输出示例 ======
+
+        原始 batch (batch_size=4):
+          prompts: ['p1', 'p2', 'p3', 'p4']
+          uid: ['id1', 'id2', 'id3', 'id4']
+
+        repeat(n=4, interleave=True) 后 (batch_size=16):
+          prompts: ['p1', 'p1', 'p1', 'p1', 'p2', 'p2', 'p2', 'p2', ...]
+          uid: ['id1', 'id1', 'id1', 'id1', 'id2', 'id2', 'id2', 'id2', ...]
+
+        注意：同一个 prompt 的 n 个 response 共享相同的 uid！
+
+        ====== interleave 参数详解 ======
+
+        interleave=True (推荐):
+          [p1, p1, p1, p1, p2, p2, p2, p2, p3, p3, p3, p3, ...]
+          同一个 prompt 的 n 个复制连续排列
+          → 更容易按 uid 分组处理
+
+        interleave=False:
+          [p1, p2, p3, p4, p1, p2, p3, p4, p1, p2, p3, p4, ...]
+          不同 prompt 交替排列
+          → 某些场景下更均匀分布
+
+        ====== 后续流程 ======
+
+        repeat 后 → generate_sequences → 每个 prompt 生成不同的 response
+        结果：4 个 prompt × 4 个 response = 16 个 trajectory
+
         Args:
-            repeat_times (int): Number of times to repeat the data.
-            interleave (bool): Whether to interleave the repeated data.
+            repeat_times (int): Number of times to repeat the data. 通常是 rollout.n
+            interleave (bool): Whether to interleave the repeated data. 推荐 True
 
         Returns:
             DataProto: A new DataProto with repeated data.
         """
         if self.batch is not None:
             if interleave:
-                # Interleave the data
+                # interleave=True: 每个 prompt 连续复制 n 次
+                # [p1,p2,p3] → [p1,p1,p1,p1, p2,p2,p2,p2, p3,p3,p3,p3]
                 repeated_tensors = {
                     key: tensor.repeat_interleave(repeat_times, dim=0) for key, tensor in self.batch.items()
                 }
             else:
-                # Stack the data
+                # interleave=False: 不同 prompt 交替复制
+                # [p1,p2,p3] → [p1,p2,p3, p1,p2,p3, p1,p2,p3, p1,p2,p3]
                 repeated_tensors = {
                     key: tensor.unsqueeze(0).expand(repeat_times, *tensor.shape).reshape(-1, *tensor.shape[1:])
                     for key, tensor in self.batch.items()
                 }
 
+            # 创建新的 TensorDict，batch_size = 原batch_size * repeat_times
             repeated_batch = TensorDict(
                 source=repeated_tensors,
                 batch_size=(self.batch.batch_size[0] * repeat_times,),
@@ -1010,11 +1293,14 @@ class DataProto:
         else:
             repeated_batch = None
 
+        # 同样处理 non_tensor_batch
         repeated_non_tensor_batch = {}
         for key, val in self.non_tensor_batch.items():
             if interleave:
+                # numpy 的 repeat 与 torch 的 repeat_interleave 类似
                 repeated_non_tensor_batch[key] = np.repeat(val, repeat_times, axis=0)
             else:
+                # numpy 的 tile 与 torch 的 expand+reshape 类似
                 repeated_non_tensor_batch[key] = np.tile(val, (repeat_times,) + (1,) * (val.ndim - 1))
 
         return type(self)(

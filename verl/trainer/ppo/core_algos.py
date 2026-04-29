@@ -13,6 +13,47 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
+====== core_algos.py 整体架构 ======
+
+这是 PPO 算法的核心实现，包含：
+
+1. AdvantageEstimator: Advantage 计算方法的枚举
+2. AdaptiveKLController/FixedKLController: KL 系数控制器
+3. compute_gae_advantage_return(): GAE Advantage 计算
+4. compute_grpo_outcome_advantage(): GRPO Advantage 计算
+5. kl_penalty(): KL 惩罚计算
+6. agg_loss(): Loss 聚合方法
+
+====== Advantage 计算方法对比 ======
+
+| 方法 | 需要 Critic | 计算公式 | 适用场景 |
+|------|------------|---------|---------|
+| GAE | 是 | A = Σ(γλ)^l * δ_l | 标准 PPO |
+| GRPO | 否 | A = (r - mean) / std | 不需要 Critic |
+| REINFORCE++ | 否 | A = r - baseline | 简单场景 |
+| RLOO | 否 | A = r - mean(other responses) | 多 response |
+
+====== KL 系数控制器 ======
+
+| 类型 | 特点 | 使用场景 |
+|------|------|---------|
+| FixedKLController | 固定 β 值 | 简单训练 |
+| AdaptiveKLController | 动态调整 β | 自适应约束 |
+
+====== 数据流示意 ======
+
+GAE 计算：
+    token_level_rewards [bsz, seq_len]
+    values [bsz, seq_len]
+    → compute_gae_advantage_return()
+    → advantages [bsz, seq_len], returns [bsz, seq_len]
+
+GRPO 计算：
+    token_level_rewards [bsz, seq_len]
+    uid [bsz]  # 用于分组
+    → compute_grpo_outcome_advantage()
+    → advantages [bsz, seq_len]
+
 Core functions to implement PPO algorithms.
 The function implemented in this file should be used by trainer with different distributed strategies to
 implement PPO-like algorithms.
@@ -88,23 +129,49 @@ def get_policy_loss_fn(name):
 class AdvantageEstimator(str, Enum):
     """Using an enumeration class to avoid spelling errors in adv_estimator.
 
+    ====== AdvantageEstimator 的作用 ======
+
+    定义 Advantage 计算方法的类型，避免配置拼写错误。
+
+    ====== 各方法简介 ======
+
+    | 方法 | 需要 Critic | 公式 | 特点 |
+    |------|------------|------|------|
+    | GAE | 是 | A = Σ(γλ)^l * δ_l | 标准 PPO，平衡短期和长期 |
+    | GRPO | 否 | A = (r - mean) / std | 不需要 Critic，用 group 统计 |
+    | REINFORCE_PLUS_PLUS | 否 | A = r - baseline | 简单 baseline |
+    | REINFORCE_PLUS_PLUS_BASELINE | 否 | A = r - learned_baseline | 学习 baseline |
+    | REMAX | 否 | A = r - greedy_reward | 与贪婪策略对比 |
+    | RLOO | 否 | A = r - mean(other) | Leave-one-out baseline |
+    | OPO | 否 | A = r - optimal_baseline | 最优 baseline |
+    | GRPO_PASSK | 否 | GRPO + pass@k | 结合 pass@k 评估 |
+    | GPG | 否 | Gradient Policy Gradient | 变体 |
+    | RLOO_VECTORIZED | 否 | RLOO 向量化版本 | 高效实现 |
+    | GRPO_VECTORIZED | 否 | GRPO 向量化版本 | 高效实现 |
+
+    ====== 使用示例 ======
+
+    config.algorithm.adv_estimator = "gae"
+    或
+    config.algorithm.adv_estimator = AdvantageEstimator.GAE
+
     Note(haibin.lin): this enum class is immutable after creation. Extending this
     enum for new estimators may not be necessary since users can always just call
     `verl.trainer.ppo.core_algos.register` with string name for a custom advantage
     estimator instead.
     """
 
-    GAE = "gae"
-    GRPO = "grpo"
-    REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
-    REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
-    REMAX = "remax"
-    RLOO = "rloo"
-    OPO = "opo"
-    GRPO_PASSK = "grpo_passk"
-    GPG = "gpg"
-    RLOO_VECTORIZED = "rloo_vectorized"
-    GRPO_VECTORIZED = "grpo_vectorized"
+    GAE = "gae"  # Generalized Advantage Estimation（标准 PPO）
+    GRPO = "grpo"  # Group Relative Policy Optimization（不需要 Critic）
+    REINFORCE_PLUS_PLUS = "reinforce_plus_plus"  # REINFORCE++
+    REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"  # REINFORCE++ with baseline
+    REMAX = "remax"  # Reward Maximization
+    RLOO = "rloo"  # Reinforce Leave-One-Out
+    OPO = "opo"  # Optimal Policy Optimization
+    GRPO_PASSK = "grpo_passk"  # GRPO with pass@k
+    GPG = "gpg"  # Gradient Policy Gradient
+    RLOO_VECTORIZED = "rloo_vectorized"  # RLOO 向量化实现
+    GRPO_VECTORIZED = "grpo_vectorized"  # GRPO 向量化实现
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -151,34 +218,96 @@ class AdaptiveKLController:
     """
     Adaptive KL controller described in the paper:
     https://arxiv.org/pdf/1909.08593.pdf
+
+    ====== AdaptiveKLController 的作用 ======
+
+    自适应调整 KL 系数 β：
+    - 如果 current_kl > target_kl，增大 β（加强约束）
+    - 如果 current_kl < target_kl，减小 β（放松约束）
+
+    ====== 调整公式 ======
+
+    proportional_error = clip(current_kl / target_kl - 1, -0.2, 0.2)
+    mult = 1 + proportional_error * n_steps / horizon
+    β_new = β_old * mult
+
+    ====== 参数说明 ======
+
+    - init_kl_coef: 初始 KL 系数 β（如 0.1）
+    - target_kl: 目标 KL 值（如 0.1）
+    - horizon: 调整速度（步数越大调整越慢）
+
+    ====== 使用示例 ======
+
+    kl_ctrl = AdaptiveKLController(init_kl_coef=0.1, target_kl=0.1, horizon=10000)
+    每步调用：
+    kl_ctrl.update(current_kl=0.05, n_steps=16)
+
+    如果 current_kl < target_kl，β 减小（放松约束）
+    如果 current_kl > target_kl，β 增大（加强约束）
     """
 
     def __init__(self, init_kl_coef, target_kl, horizon):
+        # value: 当前 KL 系数 β
         self.value = init_kl_coef
+        # target: 目标 KL 值
         self.target = target_kl
+        # horizon: 调整速度（越大调整越慢）
         self.horizon = horizon
 
     def update(self, current_kl, n_steps):
         """Update the KL coefficient based on current KL divergence.
+
+        ====== 调整逻辑 ======
+
+        1. 计算 proportional_error = current_kl / target_kl - 1
+        2. clip 到 [-0.2, 0.2]（限制调整幅度）
+        3. 计算 mult = 1 + error * n_steps / horizon
+        4. 更新 β = β * mult
 
         Args:
             current_kl (float): Current KL divergence value.
             n_steps (int): Number of steps taken.
         """
         target = self.target
+
+        # proportional_error: KL 偏离目标的程度
+        # clip 到 [-0.2, 0.2] 防止过度调整
         proportional_error = np.clip(current_kl / target - 1, -0.2, 0.2)
+
+        # mult: 调整因子
+        # n_steps / horizon: 根据步数缩放调整速度
         mult = 1 + proportional_error * n_steps / self.horizon
+
+        # 更新 KL 系数
         self.value *= mult
 
 
 class FixedKLController:
-    """Fixed KL controller."""
+    """Fixed KL controller.
+
+    ====== FixedKLController 的作用 ======
+
+    固定 KL 系数 β，不动态调整。
+
+    ====== 使用场景 ======
+
+    - 简单训练，不需要自适应约束
+    - 调试时保持固定参数
+
+    ====== update() 是空操作 ======
+
+    update() 方法不做任何事情（pass）
+    """
 
     def __init__(self, kl_coef):
+        # value: 固定的 KL 系数 β
         self.value = kl_coef
 
     def update(self, current_kl, n_steps):
         """Update method for fixed KL controller (no-op).
+
+        不做任何操作，保持 β 固定。
 
         Args:
             current_kl (float): Current KL divergence value (unused).
@@ -219,6 +348,46 @@ def compute_gae_advantage_return(
 ):
     """Adapted from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py
 
+    ====== GAE (Generalized Advantage Estimation) ======
+
+    GAE 计算每个时间步的 Advantage：
+    A_t = Σ_l (γλ)^l * δ_l
+    其中 δ_l = r_l + γV(s_{l+1}) - V(s_l)
+
+    ====== 参数含义 ======
+
+    - gamma (γ): 折扣因子，未来 reward 的权重（如 0.99）
+    - lam (λ): GAE 平滑参数，平衡短期和长期（如 0.95）
+      - λ=0: 只看即时 reward（TD(0)）
+      - λ=1: 看完整轨迹（Monte Carlo）
+
+    ====== GAE 计算优势 ======
+
+    1. 平衡偏差和方差：
+       - λ 小：低方差，高偏差（只看即时）
+       - λ 大：高方差，低偏差（看完整轨迹）
+    2. 比 REINFORCE 更稳定（有 Critic baseline）
+    3. 比 TD(0) 更准确（考虑未来）
+
+    ====== 数据流示例 ======
+
+    输入：
+    - token_level_rewards: [bsz, seq_len]  # 每个 token 的 reward
+    - values: [bsz, seq_len]                # Critic 预测的价值
+    - response_mask: [bsz, seq_len]         # response mask（EOS 后为 0）
+
+    输出：
+    - advantages: [bsz, seq_len]  # 每个 token 的 advantage
+    - returns: [bsz, seq_len]     # V 的目标值（用于更新 Critic）
+
+    ====== 计算流程 ======
+
+    1. 从最后一个 token 反向计算
+    2. 计算 δ_t = r_t + γV_next - V_t
+    3. 累加 GAE: A_t = δ_t + γλ * A_{t+1}
+    4. 计算 return: R = A + V
+    5. 标准化 advantage（whiten）
+
     Args:
         token_level_rewards: `(torch.Tensor)`
             shape is (bs, response_length)
@@ -239,24 +408,50 @@ def compute_gae_advantage_return(
 
     """
     with torch.no_grad():
+        # nextvalues: 下一个状态的 value（从后往前）
         nextvalues = 0
+
+        # lastgaelam: 上一步的 GAE（从后往前累加）
         lastgaelam = 0
+
+        # advantages_reversed: 存储反向计算的 advantage
         advantages_reversed = []
+
+        # gen_len: response 长度（token 数）
         gen_len = token_level_rewards.shape[-1]
 
+        # ====== 反向遍历每个时间步 ======
         for t in reversed(range(gen_len)):
+            # delta: TD-error，即即时 advantage
+            # δ_t = r_t + γV_next - V_t
             delta = token_level_rewards[:, t] + gamma * nextvalues - values[:, t]
+
+            # lastgaelam_: GAE 累加
+            # A_t = δ_t + γλ * A_{t+1}
             lastgaelam_ = delta + gamma * lam * lastgaelam
 
             # skip values and TD-error on observation tokens
+            # 处理 padding/EOS：如果 mask=0，保持上一个值
+            # response_mask[:, t]: 当前 token 是否有效
             nextvalues = values[:, t] * response_mask[:, t] + (1 - response_mask[:, t]) * nextvalues
             lastgaelam = lastgaelam_ * response_mask[:, t] + (1 - response_mask[:, t]) * lastgaelam
 
+            # 存储当前时间步的 advantage
             advantages_reversed.append(lastgaelam)
+
+        # 反转顺序：从后往前计算的，需要反转成从前往后
         advantages = torch.stack(advantages_reversed[::-1], dim=1)
 
+        # returns: Critic 的目标值
+        # R = A + V
+        # 用于 Critic loss: (V - R)^2
         returns = advantages + values
+
+        # masked_whiten: 标准化 advantage
+        # A = (A - mean) / std
+        # 提高训练稳定性
         advantages = verl_F.masked_whiten(advantages, response_mask)
+
     return advantages, returns
 
 

@@ -94,6 +94,59 @@ def get_master_addr_port() -> tuple[str, str]:
 
 
 class RayResourcePool(ResourcePool):
+    """
+    ====== RayResourcePool 是什么？======
+
+    RayResourcePool 是 GPU 资源池管理类，用于：
+    1. 抽象物理 GPU 资源
+    2. 创建 Ray PlacementGroup（资源调度单位）
+    3. 分配 GPU 给 Worker
+
+    ====== 核心概念 ======
+
+    process_on_nodes: 每个节点有多少个进程/GPU
+    例如 [8, 8] 表示两个节点，每个节点 8 个 GPU
+
+    max_colocate_count: 一个 GPU 可以复用多少次
+    用于 GPU 时间分片，让多个 Worker 共享同一个物理 GPU
+
+    ====== PlacementGroup 是什么？======
+
+    PlacementGroup 是 Ray 的资源调度单位，一组"bundle"的集合。
+    每个 bundle = 1 GPU + N CPU
+
+    例如 process_on_nodes=[8, 8] 会创建两个 PlacementGroup：
+    - PG_0: 8 个 bundle，分布在 Node 1
+    - PG_1: 8 个 bundle，分布在 Node 2
+
+    ====== 数据流示例 ======
+
+    配置阶段：
+      resource_pool_spec = {'global_pool': [8, 8]}  # 两个节点各 8 GPU
+      → ResourcePoolManager 创建两个 RayResourcePool
+
+    Worker 分配阶段：
+      Actor WorkerGroup 需要 16 个 Worker
+      → 每个 Worker 占用一个 bundle（1 GPU）
+      → Worker_0 用 PG_0 bundle_0，Worker_1 用 PG_0 bundle_1，...
+
+    ====== 使用示例 ======
+
+    # 创建资源池
+    pool = RayResourcePool(
+        process_on_nodes=[8, 8],  # 16 GPU total
+        use_gpu=True,
+        max_colocate_count=5      # 每个 GPU 可复用 5 次
+    )
+
+    # 获取 PlacementGroup
+    pgs = pool.get_placement_groups(strategy="STRICT_PACK")
+    # 返回 2 个 PG，各 8 个 bundle
+
+    # 创建 WorkerGroup 时使用
+    wg = RayWorkerGroup(resource_pool=pool, ...)
+    """
+
     def __init__(
         self,
         process_on_nodes: Optional[list[int]] = None,
@@ -103,43 +156,94 @@ class RayResourcePool(ResourcePool):
         detached=False,
         accelerator_type: Optional[str] = None,
     ) -> None:
+        """
+        Args:
+            process_on_nodes: 每个节点的进程数列表
+                例如 [8, 8] = 两个节点各 8 进程 = 16 GPU total
+            use_gpu: 是否分配 GPU
+            name_prefix: PlacementGroup 命名前缀
+            max_colocate_count: GPU 复用次数（时间分片）
+                默认 10，表示 1 个 GPU 可分给 10 个 Worker
+            detached: Actor 是否持久化（不随 session 结束销毁）
+            accelerator_type: 特定加速器类型（如 "H100"）
+        """
         super().__init__(process_on_nodes, max_colocate_count)
         self.use_gpu = use_gpu
-        # print(f"in RayProcessDispatchConfiguration: name_prefix = {name_prefix}")
-        self.name_prefix = get_random_string(length=6) if name_prefix is None else name_prefix
-        self.pgs = None
+        # name_prefix 用于 PlacementGroup 命名，方便调试
+        self.name_prefix = get_random_string(length:6) if name_prefix is None else name_prefix
+        self.pgs = None  # PlacementGroup 列表，创建后缓存
         self.detached = detached
         self.accelerator_type = accelerator_type
 
     def get_placement_groups(self, strategy="STRICT_PACK", name=None, device_name="cuda"):
+        """
+        创建或返回 PlacementGroup 列表
+
+        ====== strategy 参数 ======
+
+        | Strategy | 含义 | 使用场景 |
+        |----------|------|----------|
+        | STRICT_PACK | 强制打包，所有 bundle 在同一节点 | FSDP/DeepSpeed 需要节点内通信 |
+        | PACK | 尽量打包 | 默认策略 |
+        | SPREAD | 尽量分散 | 容错性高 |
+        | STRICT_SPREAD | 强制分散 | 高可用场景 |
+
+        ====== bundle 结构 ======
+
+        每个 bundle = {
+            "CPU": max_colocate_count,  # CPU 数量
+            "GPU": 1,                   # GPU 数量
+            "accelerator_type": 1e-4    # 特定 GPU 类型（可选）
+        }
+
+        ====== 返回示例 ======
+
+        process_on_nodes=[8, 8] 返回：
+        [
+            PlacementGroup_0: 8 bundles on Node_1,
+            PlacementGroup_1: 8 bundles on Node_2
+        ]
+        """
+        # 如果已经创建过，直接返回缓存的
         if self.pgs is not None:
             return self.pgs
 
+        # 生成 PlacementGroup 名称前缀
         pg_name_prefix = (
             name if name else f"{self.name_prefix}verl_group_{'_'.join([str(count) for count in self._store])}:"
         )
-        # print(f"pg_name_prefix = {pg_name_prefix}")
+
+        # 设备类型转换：cuda → GPU, npu → NPU
         if device_name == "npu":
             device_name = "NPU"
         elif device_name == "cuda":
             device_name = "GPU"
 
+        # 定义每个 bundle 的资源
         bundle = {"CPU": self.max_colocate_count}
         if self.use_gpu:
-            bundle[device_name] = 1
+            bundle[device_name] = 1  # 每个 bundle 有 1 个 GPU
             if self.accelerator_type is not None:
+                # 特定 GPU 类型（如 H100），用小数值作为标记
                 bundle[self.accelerator_type] = 1e-4
+
+        # 根据 process_on_nodes 创建 bundle 列表
+        # process_on_nodes=[8, 8] → pg_scheme=[[bundle×8], [bundle×8]]
         pg_scheme = [[bundle.copy() for _ in range(process_count)] for process_count in self._store]
 
+        # lifetime: detached 模式下 PG 持久化
         lifetime = "detached" if self.detached else None
 
+        # 创建 PlacementGroup
         pgs = [
             placement_group(bundles=bundles, strategy=strategy, name=pg_name_prefix + str(idx), lifetime=lifetime)
             for idx, bundles in enumerate(pg_scheme)
         ]
 
+        # 等待所有 PG 就绪（资源分配完成）
         ray.get([pg.ready() for pg in pgs])
 
+        # 按 node IP 排序，确保 checkpoint 恢复时 RANK 一致
         self.pgs = sort_placement_group_by_node_ip(pgs)
         return pgs
 
@@ -337,6 +441,79 @@ class RayWorkerGroup(WorkerGroup):
     This class extends WorkerGroup to provide Ray-specific functionality for
     creating and managing groups of Ray actors with specific resource requirements
     and scheduling strategies.
+
+    ====== RayWorkerGroup 是什么？======
+
+    RayWorkerGroup 管理一组 Ray Actor（Worker），提供：
+    1. 创建多个 Worker 并分配 GPU
+    2. RPC 调用 Worker 的方法
+    3. 收集多个 Worker 的结果
+
+    ====== Worker 是什么？======
+
+    Worker = Ray.remote 装饰的类 = 独立的 Python 进程
+
+    每个 Worker 运行在独立的进程中，有自己的：
+    - GPU 资源（通过 PlacementGroup 分配）
+    - 模型副本
+    - 内存空间
+
+    ====== RayWorkerGroup 结构示例 ======
+
+    RayWorkerGroup(
+        resource_pool=RayResourcePool,  # GPU 资源来源
+        ray_cls_with_init=ActorRolloutRefWorker,  # Worker 类
+        world_size=16  # 16 个 Worker
+    )
+
+    内部结构：
+    ┌─────────────────────────────────────────────────────┐
+    │  RayWorkerGroup                                     │
+    │  ─────────────────                                  │
+    │                                                     │
+    │  _workers: [Worker_0, Worker_1, ..., Worker_15]    │
+    │                                                     │
+    │  每个 Worker：                                      │
+    │  - 独立进程                                         │
+    │  - 占用 1 个 GPU                                    │
+    │  - 持有模型副本                                     │
+    │  - 通过 RPC 被调用                                  │
+    │                                                     │
+    │  方法调用：                                         │
+    │  generate_sequences(batch) →                       │
+    │    Worker_0.generate(batch[0])                     │
+    │    Worker_1.generate(batch[1])                     │
+    │    ...                                              │
+    │    Worker_15.generate(batch[15])                   │
+    │  → 收集所有结果 → concat → 返回                    │
+    └─────────────────────────────────────────────────────┘
+
+    ====== 关键方法 ======
+
+    | 方法 | 作用 |
+    |------|------|
+    | generate_sequences() | 调用所有 Worker 生成 |
+    | compute_log_prob() | 调用所有 Worker 计算 log prob |
+    | compute_values() | 调用所有 Worker 计算 values |
+    | update_actor() | 调用所有 Worker 更新 Actor |
+    | update_critic() | 调用所有 Worker 更新 Critic |
+
+    ====== RPC 调用流程 ======
+
+    1. dispatch: 将 batch 分发给各个 Worker
+    2. execute: RPC 调用 Worker.method.remote()
+    3. collect: ray.get() 获取结果，concat 合并
+
+    ====== 使用示例 ======
+
+    # 创建 WorkerGroup
+    actor_wg = RayWorkerGroup(
+        resource_pool=global_pool,
+        ray_cls_with_init=RayClassWithInitArgs(ActorRolloutRefWorker, ...)
+    )
+
+    # 调用方法（自动分发到所有 Worker）
+    output = actor_wg.generate_sequences(batch)  # batch 分成 16份，并行生成
     """
 
     def __init__(
@@ -354,25 +531,32 @@ class RayWorkerGroup(WorkerGroup):
         """Initialize a RayWorkerGroup.
 
         Args:
-            resource_pool: Resource pool for worker allocation
-            ray_cls_with_init: Class with initialization arguments for workers
-            bin_pack: Whether to use strict bin packing for resource allocation
-            name_prefix: Prefix for worker names
-            detached: Whether workers should be detached
-            worker_names: Names of existing workers to attach to
-            ray_wait_register_center_timeout: Timeout for waiting on register center
-            **kwargs: Additional keyword arguments
+            resource_pool: GPU 资源池，包含 PlacementGroup
+            ray_cls_with_init: Worker 类 + 初始化参数
+                例如：RayClassWithInitArgs(ActorRolloutRefWorker, model_path, ...)
+            bin_pack: 是否使用 STRICT_PACK 策略
+            name_prefix: Worker 命名前缀（如 "actor_"）
+            detached: Worker 是否持久化
+            worker_names: 已有 Worker 名称（用于 attach）
+            worker_handles: 已有 Worker ActorHandle（用于 attach）
+            **kwargs: device_name, profile_steps 等
+
+        ====== 初始化流程 ======
+
+        Step 1: 创建 PlacementGroup（如果 resource_pool.pgs 为空）
+        Step 2: 为每个 bundle 创建一个 Worker
+        Step 3: 设置环境变量（WORLD_SIZE, RANK, MASTER_ADDR 等）
+        Step 4: 绑定 Worker 方法到 WorkerGroup
         """
+        # master_addr 和 master_port 用于分布式通信
         self._master_addr = kwargs.pop("master_addr", None)
         self._master_port = kwargs.pop("master_port", None)
         super().__init__(resource_pool=resource_pool, **kwargs)
         self.ray_cls_with_init = ray_cls_with_init
         self.name_prefix = get_random_string(length=6) if name_prefix is None else name_prefix
         self._ray_wait_register_center_timeout = ray_wait_register_center_timeout
-        # Whether the WorkerGroup is a Colocate WorkerGroup created by FusedWorker.
+        # fused_worker 用于 Actor+Critic 共存场景
         self.fused_worker_used = ray_cls_with_init.fused_worker_used
-        # if a WorkerGroup is spawned from Colocate WorkerGroup, this indicates which sub-class is binded to
-        # this WorkerGroup.
         self.sub_cls_name = ""
         self.device_name = kwargs.get("device_name", "cuda")
         self.profile_steps = kwargs.get("profile_steps", None)

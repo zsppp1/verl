@@ -12,6 +12,46 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
+====== main_dapo.py 整体架构 ======
+
+这是 DAPO 训练的入口文件，与 main_ppo.py 结构类似。
+
+====== main_dapo.py vs main_ppo.py ======
+
+| 差异点 | main_ppo.py | main_dapo.py |
+|--------|-------------|--------------|
+| 配置文件 | ppo_trainer.yaml | dapo_trainer.yaml |
+| Trainer 类 | RayPPOTrainer | RayDAPOTrainer |
+| 训练循环 | PPO 9 步固定循环 | DAPO 动态采样循环 |
+| reward_fn | 标准 reward | DAPO reward（含动态采样逻辑） |
+
+====== DAPO 配置差异 ======
+
+dapo_trainer.yaml 关键配置：
+
+algorithm:
+  adv_estimator: grpo  # DAPO 使用 GRPO（不需要 Critic）
+  filter_groups:
+    enable: true       # 启用动态过滤
+    metric: seq_reward # 过滤指标
+    max_num_gen_batches: 10  # 最大生成次数
+  clip_ratio_low: 0.2  # 不对称裁剪（负样本）
+  clip_ratio_high: 2.0 # 不对称裁剪（正样本）
+
+actor_rollout_ref:
+  rollout:
+    n: 8  # 每个 prompt 生成 8 个 response（GRPO 需要）
+
+====== TaskRunner.run() 流程 ======
+
+1. 解析配置
+2. 加载 tokenizer
+3. 创建 Worker 类映射
+4. 创建资源池
+5. 创建数据集
+6. 创建 RayDAPOTrainer
+7. RayDAPOTrainer.fit() → DAPO 动态采样训练
+
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
 """
 
@@ -69,7 +109,55 @@ def run_ppo(config) -> None:
 
 @ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
 class TaskRunner:
+    """
+    DAPO TaskRunner 与 PPO TaskRunner 结构类似。
+
+    ====== TaskRunner 的作用 ======
+
+    TaskRunner 是 Ray Actor，运行在独立进程中：
+    - 协调 DAPO 训练流程
+    - 创建 WorkerGroup
+    - 不占用 GPU（只做调度）
+
+    ====== main_dapo.py TaskRunner vs main_ppo.py TaskRunner ======
+
+    | 差异点 | main_ppo.py TaskRunner | main_dapo.py TaskRunner |
+    |--------|------------------------|-------------------------|
+    | Trainer 类 | RayPPOTrainer | RayDAPOTrainer |
+    | Worker 选择 | 同 | 同 |
+    | 数据集创建 | 同 | 同 |
+    | 训练循环 | PPO 9 步固定循环 | DAPO 动态采样循环 |
+
+    ====== run() 方法流程 ======
+
+    1. 解析配置
+    2. 加载 tokenizer
+    3. 创建 Worker 类映射（Actor, Critic, RM）
+    4. 创建资源池
+    5. 创建数据集
+    6. 创建 RayDAPOTrainer
+    7. RayDAPOTrainer.fit() → DAPO 训练
+    """
+
     def run(self, config):
+        """执行 DAPO 训练流程。
+
+        ====== run() 流程 ======
+
+        Step 1: 解析配置
+        Step 2: 加载 tokenizer
+        Step 3: 创建 Worker 类映射
+        Step 4: 创建资源池
+        Step 5: 创建数据集
+        Step 6: 创建 RayDAPOTrainer
+        Step 7: RayDAPOTrainer.fit()
+
+        ====== 与 main_ppo.py run() 的差异 ======
+
+        主要差异在于：
+        - 创建 RayDAPOTrainer 而非 RayPPOTrainer
+        - RayDAPOTrainer 继承 RayPPOTrainer，重写 fit() 实现动态采样
+        """
         # print initial config
         from pprint import pprint
 
@@ -77,25 +165,41 @@ class TaskRunner:
 
         from verl.utils.fs import copy_to_local
 
+        # 打印当前进程信息
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
 
+        # pprint(): 打印完整配置
+        # resolve=True: 解析所有引用（如 ${actor.path}）
         pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
+
+        # resolve(): 解析配置中的所有插值引用
         OmegaConf.resolve(config)
 
+        # ====== Step 2: 加载模型 ======
         # download the checkpoint from hdfs
+        # copy_to_local(): 从远程存储下载模型到本地
         local_path = copy_to_local(config.actor_rollout_ref.model.path)
 
+        # ====== Step 3: 加载 Tokenizer ======
         # instantiate tokenizer
         from verl.utils import hf_processor, hf_tokenizer
 
+        # trust_remote_code: 是否执行模型仓库中的自定义代码
         trust_remote_code = config.data.get("trust_remote_code", False)
+
+        # hf_tokenizer(): 加载 HuggingFace tokenizer
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+
         # used for multimodal LLM, could be none
+        # processor: 多模态模型需要 processor（如图像预处理）
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
+        # ====== Step 4: 创建 Worker 类映射 ======
         from verl.single_controller.ray import RayWorkerGroup
 
         # define worker classes
+        # DAPO Worker 选择与 PPO 相同
+        # 根据 strategy（FSDP/Megatron）选择 Worker 类
         if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
             assert config.critic.strategy in {"fsdp", "fsdp2"}
 
